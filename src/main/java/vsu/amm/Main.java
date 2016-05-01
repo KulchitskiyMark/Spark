@@ -6,5 +6,6 @@ public class Main
     {
         SparkComputing job = new SparkComputing();
         job.topGenres();
+        job.topRatedFilms();
     }
 }

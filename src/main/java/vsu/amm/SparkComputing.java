@@ -9,6 +9,8 @@ import org.bson.Document;
 import scala.Tuple2;
 import com.mongodb.MongoClient;
 import com.mongodb.client.MongoDatabase;
+import scala.util.parsing.combinator.testing.Str;
+
 import java.util.*;
 
 
@@ -33,7 +35,7 @@ public class SparkComputing
         loadFiles();
     }
 
-    public void loadFiles()
+    private void loadFiles()
     {
         reviewsFile = sc.textFile(".\\src\\main\\resources\\ub.test");
         filmsFile = sc.textFile((".\\src\\main\\resources\\u.item"));
@@ -112,5 +114,61 @@ public class SparkComputing
             doc.append(t._1(), t._2());
         }
         collection.insertOne(doc);
+    }
+
+    ///////////////////////////////////////
+    // Get top-rated movies by release year
+    public void topRatedFilms()
+    {
+        // Do pairs film_id : rating
+        JavaPairRDD<Integer, Integer> filmRated = reviewsFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("\t");
+                    return new Tuple2<>(Integer.parseInt(line[1]),Integer.parseInt(line[2]));
+                }
+        );
+
+        //Summarize the number of rating for each film
+        JavaPairRDD<Integer,Integer> sumRate = filmRated.reduceByKey(
+                (Integer a, Integer b) -> a+b
+        );
+
+        // Do pairs film_id : <year, title>
+        JavaPairRDD<Integer, Tuple2<Integer, String>> filmYear = filmsFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("[|]");
+                    try {
+                        return new Tuple2<>(Integer.parseInt(line[0]), new Tuple2<>( Integer.parseInt(line[2].substring(7)),line[1].substring(0,line[1].lastIndexOf("("))));
+                    }
+                    catch (Exception e){
+                        return new Tuple2<>(Integer.parseInt(line[0]), new Tuple2<>(0, "Unknown"));
+                    }
+                }
+        );
+
+        // Get pairs year : <rating, title>
+        JavaPairRDD<Integer, Tuple2<Integer, String>> filmRankYear = filmYear.join(sumRate).values().mapToPair(
+                (Tuple2<Tuple2<Integer,String>, Integer> t) -> new Tuple2<>(t._1()._1(), new Tuple2<>(t._2(),t._1()._2()))
+        );
+
+        // Get pair with more rating
+        JavaPairRDD<Integer, Tuple2<Integer, String>> result = filmRankYear.reduceByKey(
+                (Tuple2<Integer, String> t1, Tuple2<Integer, String> t2) -> {
+                    if (t1._1() > t2._1()) return t1;
+                    else return t2;
+                }
+        );
+
+        List<Tuple2<Integer, Tuple2<Integer, String>>> l = result.sortByKey(false).collect();
+
+        MongoCollection<Document> collection = db.getCollection("TopRatedFilmForYearsAll");
+        Document doc = new Document();
+
+        for (Tuple2<Integer, Tuple2<Integer, String>> t : l)
+        {
+            doc.append(t._1().toString(), t._2()._2());
+        }
+        collection.insertOne(doc);
+
     }
 }
