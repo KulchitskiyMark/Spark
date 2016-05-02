@@ -10,7 +10,6 @@ import scala.Tuple2;
 import com.mongodb.MongoClient;
 import com.mongodb.client.MongoDatabase;
 import scala.Tuple3;
-import scala.util.parsing.combinator.testing.Str;
 
 import java.io.Serializable;
 import java.util.*;
@@ -47,7 +46,7 @@ public class SparkComputing
     }
 
     ///////////////////////////////////////
-    // Get top genres in the number of responses to the filmss
+    // Get top genres in the number of reviews to the films
     public void topGenres()
     {
         // Do pair (film_id : 1)
@@ -64,58 +63,43 @@ public class SparkComputing
                 (Integer a, Integer b) -> a + b
         );
 
-        //Get genres from file ( title : genre_id)
-        JavaPairRDD<Integer, String> genres = genresFile.mapToPair(
-                (String s) ->
-                {
-                    String[] line = s.split("[|]");
-                    return new Tuple2<>(Integer.parseInt(line[1]), line[0]);
-                }
-        );
-
-        //Get film_id and genres (film_id : array of genres)
-        JavaPairRDD<Integer, ArrayList<Integer>> films = filmsFile.mapToPair(
+        List<String> genres = genresFile.map(
                 (String s) -> {
                     String[] line = s.split("[|]");
-                    ArrayList<Integer> list = new ArrayList<>();
-                    for (int i = 0; i < 19; i++) {
-                        if (Integer.parseInt(line[i + 5]) != 0)
-                            list.add(i);
-                    }
-                    return new Tuple2<>(Integer.parseInt(line[0]), list);
+                    return line[0];
+                }
+        ).collect();
+
+        // Get pairs film_id : genres
+        JavaPairRDD<Integer, String> filmGenre = filmsFile.mapToPair(
+                 (String s) -> {
+                     String[] line = s.split("[|]");
+                     StringBuilder genre = new StringBuilder();
+                     for (int i = 0; i < 19; i++) {
+                         if (Integer.parseInt(line[i + 5]) != 0)
+                             genre.append(genres.get(i) + " ");
+                     }
+                     return new Tuple2<>(Integer.parseInt(line[0]), genre.toString());
+                 }
+        );
+
+        // Get pairs genres : count
+        JavaPairRDD<String,Integer> genreCount = filmCount.join(filmGenre).mapToPair(
+                (Tuple2<Integer, Tuple2<Integer, String>> t) -> {
+                    return new Tuple2<>(t._2()._2(), t._2()._1());
                 }
         );
 
-        //Join and get (film_id : (count reviews, array genres))
-        JavaPairRDD<Integer, Tuple2<Integer, ArrayList<Integer>>> filmGenres = filmCount.join(films);
+        // Summarize the reviews and sort
+        ArrayList<Tuple2<String, Integer>> result = new ArrayList(genreCount.reduceByKey(
+                (Integer a, Integer b) -> a + b).collect());
 
-        //Get pairs (genre_id : count reviews)
-        JavaPairRDD<Integer, Integer> genreCount = filmGenres.values().flatMapToPair(
-                (Tuple2<Integer, ArrayList<Integer>> t) -> {
-                    ArrayList<Tuple2<Integer, Integer>> list = new ArrayList<>();
-                    for (Integer el : t._2()) {
-                        list.add(new Tuple2<>(el, t._1()));
-                    }
-                    return list;
-                }
-        );
-
-        // Summarize the number of reviews for each genre
-        JavaPairRDD<Integer, Integer> countGenres = genreCount.reduceByKey(
-                (Integer a, Integer b) -> a + b
-        );
-
-        // Join and get title genres
-        JavaPairRDD<Integer, Tuple2<String, Integer>> result = genres.join(countGenres);
-
-        // Transform into an ArrayList, sorting and write to the database
-        ArrayList<Tuple2<String, Integer>> l = new ArrayList(result.values().collect());
-        Collections.sort(l, (o1, o2) -> o2._2().compareTo(o1._2()));
+        Collections.sort(result, (o1, o2) -> o2._2().compareTo(o1._2()));
 
         MongoCollection<Document> collection = db.getCollection("TopGenres");
         Document doc = new Document();
 
-        for (Tuple2<String, Integer> t : l)
+        for (Tuple2<String, Integer> t : result)
         {
             doc.append(t._1(), t._2());
         }
