@@ -8,5 +8,6 @@ public class Main
         job.topGenres();
         job.topRatedFilms();
         job.topRatedFilmsGender();
+        job.topDiscussedFilms();
     }
 }
