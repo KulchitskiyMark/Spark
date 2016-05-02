@@ -9,8 +9,10 @@ import org.bson.Document;
 import scala.Tuple2;
 import com.mongodb.MongoClient;
 import com.mongodb.client.MongoDatabase;
+import scala.Tuple3;
 import scala.util.parsing.combinator.testing.Str;
 
+import java.io.Serializable;
 import java.util.*;
 
 
@@ -170,5 +172,70 @@ public class SparkComputing
         }
         collection.insertOne(doc);
 
+        ///////////////////////////////////////////////
+        // Top-rated films for year and genres
+
+        List<String> genres = genresFile.map(
+                (String s) -> {
+                    String[] line = s.split("[|]");
+                    return line[0];
+                }
+        ).collect();
+
+        // Do pairs film_id : (year, title, genres)
+        JavaPairRDD<Integer, Tuple3<Integer, String, String>> filmYearGenre = filmsFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("[|]");
+                    StringBuilder genre = new StringBuilder();
+                    for (int i = 0; i < 19; i++) {
+                        if (Integer.parseInt(line[i + 5]) != 0)
+                            genre.append(genres.get(i) + " ");
+                    }
+                    try {
+                        return new Tuple2<>(Integer.parseInt(line[0]), new Tuple3<>(Integer.parseInt(line[2].substring(7)), line[1].substring(0, line[1].lastIndexOf("(")), genre.toString()));
+                    }
+                    catch (Exception e){
+                        return new Tuple2<>(Integer.parseInt(line[0]), new Tuple3<>(0, "Unknown", "unknown"));
+                    }
+                }
+        );
+
+        // Join and get paris film_id : (rate , year , title, genres)
+        JavaPairRDD<Integer , Tuple2<Integer, Tuple3<Integer, String, String>>> joinFilmRate = sumRate.join(filmYearGenre);
+
+        // Do pairs (year, genres) : (rate, title)
+        JavaPairRDD<Tuple2<Integer,String>,Tuple2<Integer,String>> YearGenre = joinFilmRate.values().mapToPair(
+                (Tuple2<Integer, Tuple3<Integer, String, String>> t) -> {
+                    return new Tuple2<>(new Tuple2<>(t._2()._1(), t._2()._3()), new Tuple2<>(t._1(), t._2()._2()));
+                }
+        );
+
+        // Get top-rated film for years and genres
+        JavaPairRDD<Tuple2<Integer,String>,Tuple2<Integer,String>> result2 = YearGenre.reduceByKey(
+                (Tuple2<Integer,String> t1, Tuple2<Integer,String> t2) -> {
+                    if (t1._1() > t2._1()) return t1;
+                    else return t2;
+                }
+        );
+
+        List<Tuple2<Tuple2<Integer,String>,Tuple2<Integer,String>>> l2 = result2.sortByKey(new yearComparator()).collect();
+
+        MongoCollection<Document> collection2 = db.getCollection("TopRatedFilmForYearsGenre");
+        Document doc2 = new Document();
+
+        for (Tuple2<Tuple2<Integer,String>,Tuple2<Integer,String>> t : l2)
+        {
+            doc2.append(t._1()._1() + " " + t._1()._2(), t._2()._2() + " " + t._2()._1());
+        }
+        collection2.insertOne(doc2);
+    }
+
+
+    // Comparator for (year, genres) : (rank, title)
+    public static class yearComparator implements Comparator<Tuple2<Integer, String>>, Serializable {
+        @Override
+        public int compare(Tuple2<Integer, String> o1, Tuple2<Integer, String> o2) {
+            return o2._1().compareTo(o1._1());
+        }
     }
 }
