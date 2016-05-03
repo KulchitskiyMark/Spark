@@ -466,6 +466,156 @@ public class SparkComputing
         collectionOcc.insertOne(docOcc);
     }
 
+    //////////////////////////////////////
+    // Get top-rated films (for each age group of viewers, by genre, among all)
+    public void topRatedGroup()
+    {
+        ////////////////////////////
+        // For all
+
+        // Do pairs film_id : rate
+        JavaPairRDD<Integer,Integer>  filmOneRate = reviewsFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("\t");
+                    return new Tuple2<>(Integer.parseInt(line[1]), Integer.parseInt(line[2]));
+                }
+        );
+
+        // Summarize the number of rating for each film
+        JavaPairRDD<Integer,Integer>  filmRate = filmOneRate.reduceByKey(
+                (Integer a, Integer b) -> a + b
+        );
+
+        // Do pairs film_id : title
+        JavaPairRDD<Integer, String> filmTitle = filmsFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("[|]");
+                    try {
+                        return new Tuple2<>(Integer.parseInt(line[0]),line[1].substring(0,line[1].lastIndexOf("(")));
+                    }
+                    catch (Exception e){
+                        return new Tuple2<>(Integer.parseInt(line[0]), "Unknown");
+                    }
+                }
+        );
+
+        ArrayList<Tuple2<Integer, String>> l =  new ArrayList<>(filmRate.join(filmTitle).values().collect());
+
+        Collections.sort(l, (o1, o2) -> (o2._1().compareTo(o1._1())));
+
+        MongoCollection<Document> collectionAll = db.getCollection("TopRatedFilmForAll");
+        Document docAll = new Document();
+
+        for (Tuple2<Integer, String> t : l)
+        {
+            docAll.append(t._1().toString(), t._2());
+        }
+        collectionAll.insertOne(docAll);
+
+        ///////////////////////////////////
+        // For each age group of viewers
+
+        // Do pairs film_id : user_id
+        JavaPairRDD<Integer, Integer> filmUser = reviewsFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("\t");
+                    return new Tuple2<>(Integer.parseInt(line[1]), Integer.parseInt(line[0]));
+                }
+        );
+
+        // Do pairs user_id : age
+        JavaPairRDD<Integer,Integer> userAge = usersFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("[|]");
+                    return new Tuple2<>(Integer.parseInt(line[0]), Integer.parseInt(line[1]));
+                }
+        );
+
+        // Join and get pairs film-id : (rate, user_id)
+        JavaPairRDD<Integer, Tuple2<Integer, Integer>> filmRateUser = filmRate.join(filmUser);
+
+        // Get airs user_id : (rate, title)
+        JavaPairRDD<Integer, Tuple2<Integer, String>> userRate = filmRateUser.join(filmTitle).values().mapToPair(
+                (Tuple2<Tuple2<Integer, Integer>,String> t) -> {
+                    return new Tuple2<>(t._1()._2(), new Tuple2<>(t._1()._1(), t._2()));
+                }
+        );
+
+        // Get pairs age : (rate, title)
+        JavaPairRDD<Integer, Tuple2<Integer, String>> ageRate = userRate.join(userAge).values().mapToPair(
+                (Tuple2<Tuple2<Integer, String>,Integer> t) -> {
+                    return new Tuple2<>(t._2(), new Tuple2<>(t._1()._1(), t._1()._2()));
+                }
+        );
+
+        List<Tuple2<Integer, Tuple2<Integer, String>>> res = ageRate.reduceByKey(
+                (Tuple2<Integer, String> t1, Tuple2<Integer, String> t2) -> {
+                    if (t1._1() > t2._1()) return t1;
+                    else return t2;
+                }
+        ).sortByKey(false).collect();
+
+        MongoCollection<Document> collectionAge = db.getCollection("TopRatedFilmForAge");
+        Document docAge = new Document();
+
+        for (Tuple2<Integer, Tuple2<Integer, String>> t : res)
+        {
+            docAge.append(t._1().toString(), t._2()._2() + " " + t._2()._1());
+        }
+        collectionAge.insertOne(docAge);
+
+        ///////////////////////////////////
+        // by genre
+
+        List<String> genres = genresFile.map(
+                (String s) -> {
+                    String[] line = s.split("[|]");
+                    return line[0];
+                }
+        ).collect();
+
+        // Get pairs film_id : (title, genres)
+        JavaPairRDD<Integer, Tuple2<String, String>> filmGenre = filmsFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("[|]");
+                    StringBuilder genre = new StringBuilder();
+                    for (int i = 0; i < 19; i++) {
+                        if (Integer.parseInt(line[i + 5]) != 0)
+                            genre.append(genres.get(i)).append(" ");
+                    }
+                    try {
+                        return new Tuple2<>(Integer.parseInt(line[0]), new Tuple2<>(line[1].substring(0,line[1].lastIndexOf("(")), genre.toString()));
+                    }
+                    catch (Exception e){
+                        return new Tuple2<>(Integer.parseInt(line[0]), new Tuple2<>("Unknown", "unknown"));
+                    }
+                }
+        );
+
+        // Get pairs genres : (rare, title)
+        JavaPairRDD<String, Tuple2<Integer, String>> genreRate = filmRate.join(filmGenre).values().mapToPair(
+                (Tuple2<Integer, Tuple2<String, String>> t) -> {
+                    return new Tuple2<>(t._2()._2(), new Tuple2<>(t._1(), t._2()._1()));
+                }
+        );
+
+        List<Tuple2<String, Tuple2<Integer, String>>> result = genreRate.reduceByKey(
+                (Tuple2<Integer, String> t1, Tuple2<Integer, String> t2) -> {
+                    if (t1._1()> t2._1()) return t1;
+                    else return t2;
+                }
+        ).collect();
+
+        MongoCollection<Document> collectionGenre = db.getCollection("TopRatedFilmForGenre");
+        Document docGenre = new Document();
+
+        for (Tuple2<String, Tuple2<Integer, String>> t : result)
+        {
+            docGenre.append(t._1(), t._2._2() + " " + t._2()._1());
+        }
+        collectionGenre.insertOne(docGenre);
+
+    }
 
 
 
