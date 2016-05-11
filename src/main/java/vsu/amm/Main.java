@@ -10,5 +10,7 @@ public class Main
         job.topRatedFilmsGender();
         job.topDiscussedFilms();
         job.topRatedGroup();
+        job.topGenresByUser();
+        job.lastGenre();
     }
 }

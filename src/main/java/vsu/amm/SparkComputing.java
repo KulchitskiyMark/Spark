@@ -1,14 +1,15 @@
 package vsu.amm;
 
-import com.mongodb.client.MongoCollection;
+import com.mongodb.hadoop.MongoOutputFormat;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.spark.SparkConf;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
 import org.apache.spark.api.java.JavaSparkContext;
-import org.bson.Document;
+
+import org.bson.BSONObject;
+import org.bson.BasicBSONObject;
 import scala.Tuple2;
-import com.mongodb.MongoClient;
-import com.mongodb.client.MongoDatabase;
 import scala.Tuple3;
 
 import java.io.Serializable;
@@ -22,8 +23,6 @@ public class SparkComputing
     private JavaRDD<String> filmsFile;
     private JavaRDD<String> genresFile;
     private JavaRDD<String> usersFile;
-    private MongoClient mongoClient;
-    private  MongoDatabase db;
 
     SparkComputing()
     {
@@ -32,8 +31,6 @@ public class SparkComputing
                 .setMaster("local[*]")
                 .set("spark.driver.host", "localhost");
         sc = new JavaSparkContext(conf);
-        mongoClient = new MongoClient();
-        db = mongoClient.getDatabase("Ratings");
         loadFiles();
     }
 
@@ -72,15 +69,15 @@ public class SparkComputing
 
         // Get pairs film_id : genres
         JavaPairRDD<Integer, String> filmGenre = filmsFile.mapToPair(
-                 (String s) -> {
-                     String[] line = s.split("[|]");
-                     StringBuilder genre = new StringBuilder();
-                     for (int i = 0; i < 19; i++) {
-                         if (Integer.parseInt(line[i + 5]) != 0)
-                             genre.append(genres.get(i) + " ");
-                     }
-                     return new Tuple2<>(Integer.parseInt(line[0]), genre.toString());
-                 }
+                (String s) -> {
+                    String[] line = s.split("[|]");
+                    StringBuilder genre = new StringBuilder();
+                    for (int i = 0; i < 19; i++) {
+                        if (Integer.parseInt(line[i + 5]) != 0)
+                            genre.append(genres.get(i)).append(" ");
+                    }
+                    return new Tuple2<>(Integer.parseInt(line[0]), genre.toString());
+                }
         );
 
         // Get pairs genres : count
@@ -90,26 +87,42 @@ public class SparkComputing
                 }
         );
 
-        // Summarize the reviews and sort
-        ArrayList<Tuple2<String, Integer>> result = new ArrayList(genreCount.reduceByKey(
-                (Integer a, Integer b) -> a + b).collect());
+        // Summarize the reviews for each genre
+        JavaPairRDD<String, Integer> result = genreCount.reduceByKey(
+                (Integer a, Integer b) -> a + b);
 
-        Collections.sort(result, (o1, o2) -> o2._2().compareTo(o1._2()));
+        JavaPairRDD<Integer, String> resultSorted = result.mapToPair(
+                (Tuple2<String, Integer> t) -> {
+                    return new Tuple2<>(t._2(),t._1());
+                }
+        ).sortByKey(false);
 
-        MongoCollection<Document> collection = db.getCollection("TopGenres");
-        Document doc = new Document();
+        Configuration outputConfig = new Configuration();
+        outputConfig.set("mongo.output.uri", "mongodb://localhost:27017/ResultDB.TopGenres");
 
-        for (Tuple2<String, Integer> t : result)
-        {
-            doc.append(t._1(), t._2());
-        }
-        collection.insertOne(doc);
+        JavaPairRDD<Object, BSONObject> save = resultSorted.mapToPair(
+                (Tuple2<Integer, String> t) -> {
+                    BSONObject bson = new BasicBSONObject();
+                    bson.put("genres", t._2());
+                    bson.put("reviews", t._1());
+                    return new Tuple2<>(null, bson);
+                }
+        );
+        save.saveAsNewAPIHadoopFile(
+                "file:///tmp",
+                Object.class,
+                Object.class,
+                MongoOutputFormat.class,
+                outputConfig
+        );
     }
 
     ///////////////////////////////////////
-    // Get top-rated movies by release year and genres
+    // Get top-rated films by release year and genres
     public void topRatedFilms()
     {
+        // Top-rated films by release year among all
+
         // Do pairs film_id : rating
         JavaPairRDD<Integer, Integer> filmRated = reviewsFile.mapToPair(
                 (String s) -> {
@@ -136,29 +149,38 @@ public class SparkComputing
                 }
         );
 
-        // Get pairs year : <rating, title>
+        // Get pairs year : <rate, title>
         JavaPairRDD<Integer, Tuple2<Integer, String>> filmRankYear = filmYear.join(sumRate).values().mapToPair(
                 (Tuple2<Tuple2<Integer,String>, Integer> t) -> new Tuple2<>(t._1()._1(), new Tuple2<>(t._2(),t._1()._2()))
         );
 
-        // Get pair with more rating
+        // Get pair with more rate
         JavaPairRDD<Integer, Tuple2<Integer, String>> result = filmRankYear.reduceByKey(
                 (Tuple2<Integer, String> t1, Tuple2<Integer, String> t2) -> {
                     if (t1._1() > t2._1()) return t1;
                     else return t2;
                 }
+        ).sortByKey(false);
+
+        Configuration outputConfig = new Configuration();
+        outputConfig.set("mongo.output.uri", "mongodb://localhost:27017/ResultDB.TopRatedByYearAll");
+
+        JavaPairRDD<Object, BSONObject> save = result.mapToPair(
+                (Tuple2<Integer,Tuple2 <Integer, String>> t) -> {
+                    BSONObject bson = new BasicBSONObject();
+                    bson.put("year", t._1());
+                    bson.put("rate", t._2()._1());
+                    bson.put("title", t._2()._2());
+                    return new Tuple2<>(null, bson);
+                }
         );
-
-        List<Tuple2<Integer, Tuple2<Integer, String>>> l = result.sortByKey(false).collect();
-
-        MongoCollection<Document> collection = db.getCollection("TopRatedFilmForYearsAll");
-        Document doc = new Document();
-
-        for (Tuple2<Integer, Tuple2<Integer, String>> t : l)
-        {
-            doc.append(t._1().toString(), t._2()._2() + " " + t._2()._1());
-        }
-        collection.insertOne(doc);
+        save.saveAsNewAPIHadoopFile(
+                "file:///tmp",
+                Object.class,
+                Object.class,
+                MongoOutputFormat.class,
+                outputConfig
+        );
 
         ///////////////////////////////////////////////
         // Top-rated films for year and genres
@@ -206,42 +228,43 @@ public class SparkComputing
                 }
         );
 
-        List<Tuple2<Tuple2<Integer,String>,Tuple2<Integer,String>>> l2 = result2.sortByKey(new yearComparator()).collect();
+        // Do pairs year,rate : genre, title
+        JavaPairRDD<Tuple2<Integer,Integer>,Tuple2<String,String>> resultSorted = result2.mapToPair(
+                (Tuple2<Tuple2<Integer,String>,Tuple2<Integer,String>> t) -> {
+                    return new Tuple2<>(new Tuple2<>(t._1()._1(), t._2()._1()), new Tuple2<>(t._1()._2(), t._2()._2()));
+                }
+        ).sortByKey(new yearComparator());
 
-        MongoCollection<Document> collection2 = db.getCollection("TopRatedFilmForYearsGenre");
-        Document doc2 = new Document();
+        outputConfig.set("mongo.output.uri", "mongodb://localhost:27017/ResultDB.TopRatedByYearGenre");
 
-        for (Tuple2<Tuple2<Integer,String>,Tuple2<Integer,String>> t : l2)
-        {
-            doc2.append(t._1()._1() + " " + t._1()._2(), t._2()._2() + " " + t._2()._1());
-        }
-        collection2.insertOne(doc2);
+        JavaPairRDD<Object, BSONObject> save2 = resultSorted.mapToPair(
+                (Tuple2<Tuple2<Integer,Integer>,Tuple2<String,String>> t) -> {
+                    BSONObject bson = new BasicBSONObject();
+                    bson.put("year", t._1()._1());
+                    bson.put("rate", t._1()._2());
+                    bson.put("genre", t._2()._1());
+                    bson.put("title", t._2()._2());
+                    return new Tuple2<>(null, bson);
+                }
+        );
+        save2.saveAsNewAPIHadoopFile(
+                "file:///tmp",
+                Object.class,
+                Object.class,
+                MongoOutputFormat.class,
+                outputConfig
+        );
     }
 
     ///////////////////////////////////////
     // Get top-rated movies (for men, for women, by gender activities)
     public  void topRatedFilmsGender()
     {
-        // Get pairs user_id : gander
+        // Get pairs user_id : gender
         JavaPairRDD<Integer, String> users = usersFile.mapToPair(
                 (String s) -> {
                     String[] line = s.split("[|]");
                     return new Tuple2<>(Integer.parseInt(line[0]), line[2]);
-                }
-        );
-
-        // Do pairs film_id : (rating, user_id)
-        JavaPairRDD<Integer, Tuple2<Integer,Integer>> filmRated = reviewsFile.mapToPair(
-                (String s) -> {
-                    String[] line = s.split("\t");
-                    return new Tuple2<>(Integer.parseInt(line[1]),new Tuple2<>(Integer.parseInt(line[2]), Integer.parseInt(line[0])));
-                }
-        );
-
-        //Summarize the number of rating for each film
-        JavaPairRDD<Integer,Tuple2<Integer,Integer>> sumRate = filmRated.reduceByKey(
-                (Tuple2<Integer,Integer> t1, Tuple2<Integer,Integer> t2) -> {
-                    return new Tuple2<>(t1._1() + t2._1(), t1._2());
                 }
         );
 
@@ -258,51 +281,96 @@ public class SparkComputing
                 }
         );
 
-        // Join and get pairs user-id : (rate, title)
-        JavaPairRDD<Integer, Tuple2<Integer, String>> filmUser = filmTitle.join(sumRate).mapToPair(
-                (Tuple2<Integer, Tuple2<String, Tuple2<Integer,Integer>>> t) -> {
-                    return new Tuple2<>(t._2()._2()._2(), new Tuple2<>(t._2()._2()._1(), t._2()._1()));
+        // Get pairs user_id : film_id , rate
+        JavaPairRDD<Integer, Tuple2<Integer, Integer>> filmUserRate = reviewsFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("\t");
+                    return new Tuple2<>(Integer.parseInt(line[0]), new Tuple2<>(Integer.parseInt(line[1]), Integer.parseInt(line[2])));
                 }
         );
 
-        // Join and get pairs gender : (rate, title)
-        JavaPairRDD<String, Tuple2<Integer,String>> userRate = users.join(filmUser).mapToPair(
-                (Tuple2<Integer, Tuple2<String, Tuple2<Integer, String>>> t) -> {
-                    return new Tuple2<>(t._2()._1(), new Tuple2<>(t._2()._2()._1(), t._2()._2()._2()));
-                }
+        // Do pairs film : rate , gender
+        JavaPairRDD<Integer, Tuple2<Integer, String>> genderRate = filmUserRate.join(users).mapToPair(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, Integer>, String>> t) -> new Tuple2<>(t._2()._1()._1(), new Tuple2<>(t._2()._1()._2(), t._2()._2()))
         );
 
+        // Do pairs film : (rate, gender), title
+        JavaPairRDD<Integer, Tuple2<Tuple2<Integer, String>, String>> filmTitleRate = genderRate.join(filmTitle);
+
+        /////////////////////////////////
         // Get top-rated films for male
-        List<Tuple2<String, Tuple2<Integer, String>>> resultMale = userRate.filter(
-                (Tuple2<String, Tuple2<Integer, String>> t) -> {
-                    return (t._1().contains("M"));
+        JavaPairRDD<Integer, Tuple2<Tuple2<Integer, String>, String>> filmRateMale = filmTitleRate.filter(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, String>, String>> t) -> {
+                    return t._2()._1()._2().contains("M");
                 }
-        ).takeOrdered(10, new rateComparatop());
+        );
 
-        MongoCollection<Document> collectionMale = db.getCollection("TopRatedFilmForMale");
-        Document docMale = new Document();
+        JavaPairRDD<Integer, Tuple2<Tuple2<Integer, String>, String>> sumRateMale = filmRateMale.reduceByKey(
+                (Tuple2<Tuple2<Integer, String>, String> t1, Tuple2<Tuple2<Integer, String>, String> t2) -> {
+                    return new Tuple2<>(new Tuple2<>(t1._1()._1() + t2._1()._1(), t1._1()._2()), t1._2());
+                }
+        );
 
-        for (Tuple2<String, Tuple2<Integer, String>> t : resultMale)
-        {
-            docMale.append(t._2()._1().toString(), t._2()._2());
-        }
-        collectionMale.insertOne(docMale);
+        // Do pairs rate : title
+        JavaPairRDD<Integer, String> resultMale = sumRateMale.mapToPair(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, String>, String>> t) -> new Tuple2<>(t._2()._1()._1(), t._2()._2())
+        ).sortByKey(false);
 
+        Configuration outputConfig = new Configuration();
+        outputConfig.set("mongo.output.uri", "mongodb://localhost:27017/ResultDB.TopRatedAmongMale");
+
+        JavaPairRDD<Object, BSONObject> saveMale = resultMale.mapToPair(
+                (Tuple2<Integer, String> t) -> {
+                    BSONObject bson = new BasicBSONObject();
+                    bson.put("rate", t._1());
+                    bson.put("title", t._2());
+                    return new Tuple2<>(null, bson);
+                }
+        );
+        saveMale.saveAsNewAPIHadoopFile(
+                "file:///tmp",
+                Object.class,
+                Object.class,
+                MongoOutputFormat.class,
+                outputConfig
+        );
+
+        /////////////////////////////////
         // Get top-rated films for female
-        List<Tuple2<String, Tuple2<Integer, String>>> resultFemale = userRate.filter(
-                (Tuple2<String, Tuple2<Integer, String>> t) -> {
-                    return (t._1().contains("F"));
+        JavaPairRDD<Integer, Tuple2<Tuple2<Integer, String>, String>> filmRateFemale = filmTitleRate.filter(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, String>, String>> t) -> {
+                    return t._2()._1()._2().contains("F");
                 }
-        ).takeOrdered(10, new rateComparatop());
+        );
 
-        MongoCollection<Document> collectionFemale = db.getCollection("TopRatedFilmForFemale");
-        Document docFemale = new Document();
+        JavaPairRDD<Integer, Tuple2<Tuple2<Integer, String>, String>> sumRateFemale = filmRateFemale.reduceByKey(
+                (Tuple2<Tuple2<Integer, String>, String> t1, Tuple2<Tuple2<Integer, String>, String> t2) -> {
+                    return new Tuple2<>(new Tuple2<>(t1._1()._1() + t2._1()._1(), t1._1()._2()), t1._2());
+                }
+        );
 
-        for (Tuple2<String, Tuple2<Integer, String>> t : resultFemale)
-        {
-            docFemale.append(t._2()._1().toString(), t._2()._2());
-        }
-        collectionFemale.insertOne(docFemale);
+        // Do pairs rate : title
+        JavaPairRDD<Integer, String> resultFemale = sumRateFemale.mapToPair(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, String>, String>> t) -> new Tuple2<>(t._2()._1()._1(), t._2()._2())
+        ).sortByKey(false);
+
+        outputConfig.set("mongo.output.uri", "mongodb://localhost:27017/ResultDB.TopRatedAmongFemale");
+
+        JavaPairRDD<Object, BSONObject> saveFemale = resultFemale.mapToPair(
+                (Tuple2<Integer, String> t) -> {
+                    BSONObject bson = new BasicBSONObject();
+                    bson.put("rate", t._1());
+                    bson.put("title", t._2());
+                    return new Tuple2<>(null, bson);
+                }
+        );
+        saveFemale.saveAsNewAPIHadoopFile(
+                "file:///tmp",
+                Object.class,
+                Object.class,
+                MongoOutputFormat.class,
+                outputConfig
+        );
 
         //////////////////////////////////
         //Get top-rated for occupation
@@ -315,57 +383,63 @@ public class SparkComputing
                 }
         );
 
-        // Join and get occupation : (rate, title)
-        JavaPairRDD<String, Tuple2<Integer,String>> rateOcc = userOcc.join(filmUser).mapToPair(
-                (Tuple2<Integer, Tuple2<String, Tuple2<Integer, String>>> t) -> {
-                    return new Tuple2<>(t._2()._1(), new Tuple2<>(t._2()._2()._1(), t._2()._2()._2()));
+        // Do pairs film : rate , occ
+        JavaPairRDD<Integer, Tuple2<Integer, String>> occRate = filmUserRate.join(userOcc).mapToPair(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, Integer>, String>> t) -> new Tuple2<>(t._2()._1()._1(), new Tuple2<>(t._2()._1()._2(), t._2()._2()))
+        );
+
+        // Do pairs film, occ : rate, title
+        JavaPairRDD<Tuple2<Integer, String>,Tuple2<Integer, String>> filmOccRate = occRate.join(filmTitle).mapToPair(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, String>, String>> t) -> {
+                    return new Tuple2<>(new Tuple2<>(t._1(), t._2()._1()._2()),new Tuple2<>(t._2()._1()._1(), t._2()._2()));
                 }
         );
 
-        // Sort by occupation
-        JavaPairRDD<String, Tuple2<Integer,String>> resultOcc = rateOcc.reduceByKey(
-                (Tuple2<Integer,String> t1, Tuple2<Integer,String> t2) -> {
-                    if (t1._1() > t2._1()) return t1;
+        JavaPairRDD<Tuple2<Integer, String>,Tuple2<Integer, String>> sumRateOcc = filmOccRate.reduceByKey(
+                (Tuple2<Integer, String> t1, Tuple2<Integer, String> t2) -> new Tuple2<>(t1._1()+ t2._1(), t1._2())
+        );
+
+        // Do pairs occupation : rate, title
+        JavaPairRDD<String, Tuple2<Integer, String>> occSumRate = sumRateOcc.mapToPair(
+                (Tuple2<Tuple2<Integer, String>,Tuple2<Integer, String>> t) -> new Tuple2<>(t._1()._2(), new Tuple2<>(t._2()._1(), t._2()._2()))
+        );
+
+        JavaPairRDD<String, Tuple2<Integer, String>> resultOcc = occSumRate.reduceByKey(
+                (Tuple2<Integer, String> t1, Tuple2<Integer, String> t2) -> {
+                    if (t1._1()> t2._1()) return t1;
                     else return t2;
                 }
         );
 
-        List<Tuple2<String, Tuple2<Integer,String>>> l = resultOcc.collect();
+        outputConfig.set("mongo.output.uri", "mongodb://localhost:27017/ResultDB.TopRatedAmongOccupation");
 
-        MongoCollection<Document> collectionOcc = db.getCollection("TopRatedFilmForOcc");
-        Document docOcc = new Document();
-
-        for (Tuple2<String, Tuple2<Integer, String>> t : l)
-        {
-            docOcc.append(t._1(), t._2()._2() + " " + t._2()._1());
-        }
-        collectionOcc.insertOne(docOcc);
+        JavaPairRDD<Object, BSONObject> saveOcc = resultOcc.mapToPair(
+                (Tuple2<String, Tuple2<Integer, String>> t) -> {
+                    BSONObject bson = new BasicBSONObject();
+                    bson.put("occupation", t._1());
+                    bson.put("rate", t._2()._1());
+                    bson.put("title", t._2()._2());
+                    return new Tuple2<>(null, bson);
+                }
+        );
+        saveOcc.saveAsNewAPIHadoopFile(
+                "file:///tmp",
+                Object.class,
+                Object.class,
+                MongoOutputFormat.class,
+                outputConfig
+        );
     }
 
     //////////////////////////////////////
     // Get most discussed films (for men, for women, by gender activities))
     public  void topDiscussedFilms()
     {
-        // Get pairs user_id : gander
+        // Get pairs user_id : gender
         JavaPairRDD<Integer, String> users = usersFile.mapToPair(
                 (String s) -> {
                     String[] line = s.split("[|]");
                     return new Tuple2<>(Integer.parseInt(line[0]), line[2]);
-                }
-        );
-
-        // Do pairs film_id : (1, user_id)
-        JavaPairRDD<Integer, Tuple2<Integer,Integer>> filmCount = reviewsFile.mapToPair(
-                (String s) -> {
-                    String[] line = s.split("\t");
-                    return new Tuple2<>(Integer.parseInt(line[1]),new Tuple2<>(1, Integer.parseInt(line[0])));
-                }
-        );
-
-        //Summarize the number of films
-        JavaPairRDD<Integer,Tuple2<Integer,Integer>> sumFilms = filmCount.reduceByKey(
-                (Tuple2<Integer,Integer> t1, Tuple2<Integer,Integer> t2) -> {
-                    return new Tuple2<>(t1._1() + t2._1(), t1._2());
                 }
         );
 
@@ -382,51 +456,96 @@ public class SparkComputing
                 }
         );
 
-        // Join and get pairs user-id : (count, title)
-        JavaPairRDD<Integer, Tuple2<Integer, String>> filmUser = filmTitle.join(sumFilms).mapToPair(
-                (Tuple2<Integer, Tuple2<String, Tuple2<Integer,Integer>>> t) -> {
-                    return new Tuple2<>(t._2()._2()._2(), new Tuple2<>(t._2()._2()._1(), t._2()._1()));
+        // Get pairs user_id : film_id , reviews
+        JavaPairRDD<Integer, Tuple2<Integer, Integer>> filmUserReviews = reviewsFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("\t");
+                    return new Tuple2<>(Integer.parseInt(line[0]), new Tuple2<>(Integer.parseInt(line[1]), 1));
                 }
         );
 
-        // Join and get pairs gender : (count, title)
-        JavaPairRDD<String, Tuple2<Integer,String>> userCount = users.join(filmUser).mapToPair(
-                (Tuple2<Integer, Tuple2<String, Tuple2<Integer, String>>> t) -> {
-                    return new Tuple2<>(t._2()._1(), new Tuple2<>(t._2()._2()._1(), t._2()._2()._2()));
-                }
+        // Do pairs film : reviews , gender
+        JavaPairRDD<Integer, Tuple2<Integer, String>> genderReviews = filmUserReviews.join(users).mapToPair(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, Integer>, String>> t) -> new Tuple2<>(t._2()._1()._1(), new Tuple2<>(t._2()._1()._2(), t._2()._2()))
         );
 
+        // Do pairs film : (reviews, gender), title
+        JavaPairRDD<Integer, Tuple2<Tuple2<Integer, String>, String>> filmTitleReviews = genderReviews.join(filmTitle);
+
+        /////////////////////////////////
         // Get top-reviews films for male
-        List<Tuple2<String, Tuple2<Integer, String>>> resultMale = userCount.filter(
-                (Tuple2<String, Tuple2<Integer, String>> t) -> {
-                    return (t._1().contains("M"));
+        JavaPairRDD<Integer, Tuple2<Tuple2<Integer, String>, String>> filmReviewsMale = filmTitleReviews.filter(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, String>, String>> t) -> {
+                    return t._2()._1()._2().contains("M");
                 }
-        ).takeOrdered(10, new rateComparatop());
+        );
 
-        MongoCollection<Document> collectionMale = db.getCollection("TopReviewsFilmForMale");
-        Document docMale = new Document();
+        JavaPairRDD<Integer, Tuple2<Tuple2<Integer, String>, String>> sumReviewsMale = filmReviewsMale.reduceByKey(
+                (Tuple2<Tuple2<Integer, String>, String> t1, Tuple2<Tuple2<Integer, String>, String> t2) -> {
+                    return new Tuple2<>(new Tuple2<>(t1._1()._1() + t2._1()._1(), t1._1()._2()), t1._2());
+                }
+        );
 
-        for (Tuple2<String, Tuple2<Integer, String>> t : resultMale)
-        {
-            docMale.append(t._2()._1().toString(), t._2()._2());
-        }
-        collectionMale.insertOne(docMale);
+        // Do pairs reviews : title
+        JavaPairRDD<Integer, String> resultMale = sumReviewsMale.mapToPair(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, String>, String>> t) -> new Tuple2<>(t._2()._1()._1(), t._2()._2())
+        ).sortByKey(false);
 
+        Configuration outputConfig = new Configuration();
+        outputConfig.set("mongo.output.uri", "mongodb://localhost:27017/ResultDB.TopReviewsAmongMale");
+
+        JavaPairRDD<Object, BSONObject> saveMale = resultMale.mapToPair(
+                (Tuple2<Integer, String> t) -> {
+                    BSONObject bson = new BasicBSONObject();
+                    bson.put("reviews", t._1());
+                    bson.put("title", t._2());
+                    return new Tuple2<>(null, bson);
+                }
+        );
+        saveMale.saveAsNewAPIHadoopFile(
+                "file:///tmp",
+                Object.class,
+                Object.class,
+                MongoOutputFormat.class,
+                outputConfig
+        );
+
+        /////////////////////////////////
         // Get top-reviews films for female
-        List<Tuple2<String, Tuple2<Integer, String>>> resultFemale = userCount.filter(
-                (Tuple2<String, Tuple2<Integer, String>> t) -> {
-                    return (t._1().contains("F"));
+        JavaPairRDD<Integer, Tuple2<Tuple2<Integer, String>, String>> filmReviewsFemale = filmTitleReviews.filter(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, String>, String>> t) -> {
+                    return t._2()._1()._2().contains("F");
                 }
-        ).takeOrdered(10, new rateComparatop());
+        );
 
-        MongoCollection<Document> collectionFemale = db.getCollection("TopReviewsFilmForFemale");
-        Document docFemale = new Document();
+        JavaPairRDD<Integer, Tuple2<Tuple2<Integer, String>, String>> sumReviewsFemale = filmReviewsFemale.reduceByKey(
+                (Tuple2<Tuple2<Integer, String>, String> t1, Tuple2<Tuple2<Integer, String>, String> t2) -> {
+                    return new Tuple2<>(new Tuple2<>(t1._1()._1() + t2._1()._1(), t1._1()._2()), t1._2());
+                }
+        );
 
-        for (Tuple2<String, Tuple2<Integer, String>> t : resultFemale)
-        {
-            docFemale.append(t._2()._1().toString(), t._2()._2());
-        }
-        collectionFemale.insertOne(docFemale);
+        // Do pairs reviews : title
+        JavaPairRDD<Integer, String> resultFemale = sumReviewsFemale.mapToPair(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, String>, String>> t) -> new Tuple2<>(t._2()._1()._1(), t._2()._2())
+        ).sortByKey(false);
+
+        outputConfig.set("mongo.output.uri", "mongodb://localhost:27017/ResultDB.TopReviewsAmongFemale");
+
+        JavaPairRDD<Object, BSONObject> saveFemale = resultFemale.mapToPair(
+                (Tuple2<Integer, String> t) -> {
+                    BSONObject bson = new BasicBSONObject();
+                    bson.put("reviews", t._1());
+                    bson.put("title", t._2());
+                    return new Tuple2<>(null, bson);
+                }
+        );
+        saveFemale.saveAsNewAPIHadoopFile(
+                "file:///tmp",
+                Object.class,
+                Object.class,
+                MongoOutputFormat.class,
+                outputConfig
+        );
 
         //////////////////////////////////
         //Get top-reviews for occupation
@@ -439,31 +558,52 @@ public class SparkComputing
                 }
         );
 
-        // Join and get occupation : (count, title)
-        JavaPairRDD<String, Tuple2<Integer,String>> rateOcc = userOcc.join(filmUser).mapToPair(
-                (Tuple2<Integer, Tuple2<String, Tuple2<Integer, String>>> t) -> {
-                    return new Tuple2<>(t._2()._1(), new Tuple2<>(t._2()._2()._1(), t._2()._2()._2()));
+        // Do pairs film : reviews , occ
+        JavaPairRDD<Integer, Tuple2<Integer, String>> occReviews = filmUserReviews.join(userOcc).mapToPair(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, Integer>, String>> t) -> new Tuple2<>(t._2()._1()._1(), new Tuple2<>(t._2()._1()._2(), t._2()._2()))
+        );
+
+        // Do pairs film, occ : reviews, title
+        JavaPairRDD<Tuple2<Integer, String>,Tuple2<Integer, String>> filmOccReviews = occReviews.join(filmTitle).mapToPair(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, String>, String>> t) -> {
+                    return new Tuple2<>(new Tuple2<>(t._1(), t._2()._1()._2()),new Tuple2<>(t._2()._1()._1(), t._2()._2()));
                 }
         );
 
-        // Sort by occupation
-        JavaPairRDD<String, Tuple2<Integer,String>> resultOcc = rateOcc.reduceByKey(
-                (Tuple2<Integer,String> t1, Tuple2<Integer,String> t2) -> {
-                    if (t1._1() > t2._1()) return t1;
+        JavaPairRDD<Tuple2<Integer, String>,Tuple2<Integer, String>> sumReviewsOcc = filmOccReviews.reduceByKey(
+                (Tuple2<Integer, String> t1, Tuple2<Integer, String> t2) -> new Tuple2<>(t1._1()+ t2._1(), t1._2())
+        );
+
+        // Do pairs occupation : reviews, title
+        JavaPairRDD<String, Tuple2<Integer, String>> occSumReviews = sumReviewsOcc.mapToPair(
+                (Tuple2<Tuple2<Integer, String>,Tuple2<Integer, String>> t) -> new Tuple2<>(t._1()._2(), new Tuple2<>(t._2()._1(), t._2()._2()))
+        );
+
+        JavaPairRDD<String, Tuple2<Integer, String>> resultOcc = occSumReviews.reduceByKey(
+                (Tuple2<Integer, String> t1, Tuple2<Integer, String> t2) -> {
+                    if (t1._1()> t2._1()) return t1;
                     else return t2;
                 }
         );
 
-        List<Tuple2<String, Tuple2<Integer,String>>> l = resultOcc.collect();
+        outputConfig.set("mongo.output.uri", "mongodb://localhost:27017/ResultDB.TopReviewsAmongOccupation");
 
-        MongoCollection<Document> collectionOcc = db.getCollection("TopReviewsFilmForOcc");
-        Document docOcc = new Document();
-
-        for (Tuple2<String, Tuple2<Integer, String>> t : l)
-        {
-            docOcc.append(t._1(), t._2()._2() + " " + t._2()._1());
-        }
-        collectionOcc.insertOne(docOcc);
+        JavaPairRDD<Object, BSONObject> saveOcc = resultOcc.mapToPair(
+                (Tuple2<String, Tuple2<Integer, String>> t) -> {
+                    BSONObject bson = new BasicBSONObject();
+                    bson.put("occupation", t._1());
+                    bson.put("reviews", t._2()._1());
+                    bson.put("title", t._2()._2());
+                    return new Tuple2<>(null, bson);
+                }
+        );
+        saveOcc.saveAsNewAPIHadoopFile(
+                "file:///tmp",
+                Object.class,
+                Object.class,
+                MongoOutputFormat.class,
+                outputConfig
+        );
     }
 
     //////////////////////////////////////
@@ -482,7 +622,7 @@ public class SparkComputing
         );
 
         // Summarize the number of rating for each film
-        JavaPairRDD<Integer,Integer>  filmRate = filmOneRate.reduceByKey(
+        JavaPairRDD<Integer,Integer> sumRate = filmOneRate.reduceByKey(
                 (Integer a, Integer b) -> a + b
         );
 
@@ -499,29 +639,31 @@ public class SparkComputing
                 }
         );
 
-        ArrayList<Tuple2<Integer, String>> l =  new ArrayList<>(filmRate.join(filmTitle).values().collect());
+        JavaPairRDD<Integer, String> resultAll = sumRate.join(filmTitle).mapToPair(
+                (Tuple2<Integer, Tuple2<Integer, String>> t) -> new Tuple2<>(t._2()._1(), t._2()._2())
+        ).sortByKey(false);
 
-        Collections.sort(l, (o1, o2) -> (o2._1().compareTo(o1._1())));
+        Configuration outputConfig = new Configuration();
+        outputConfig.set("mongo.output.uri", "mongodb://localhost:27017/ResultDB.TopRatedAmongAll");
 
-        MongoCollection<Document> collectionAll = db.getCollection("TopRatedFilmForAll");
-        Document docAll = new Document();
-
-        for (Tuple2<Integer, String> t : l)
-        {
-            docAll.append(t._1().toString(), t._2());
-        }
-        collectionAll.insertOne(docAll);
+        JavaPairRDD<Object, BSONObject> saveAll = resultAll.mapToPair(
+                (Tuple2<Integer, String> t) -> {
+                    BSONObject bson = new BasicBSONObject();
+                    bson.put("rate", t._1());
+                    bson.put("title", t._2());
+                    return new Tuple2<>(null, bson);
+                }
+        );
+        saveAll.saveAsNewAPIHadoopFile(
+                "file:///tmp",
+                Object.class,
+                Object.class,
+                MongoOutputFormat.class,
+                outputConfig
+        );
 
         ///////////////////////////////////
         // For each age group of viewers
-
-        // Do pairs film_id : user_id
-        JavaPairRDD<Integer, Integer> filmUser = reviewsFile.mapToPair(
-                (String s) -> {
-                    String[] line = s.split("\t");
-                    return new Tuple2<>(Integer.parseInt(line[1]), Integer.parseInt(line[0]));
-                }
-        );
 
         // Do pairs user_id : age
         JavaPairRDD<Integer,Integer> userAge = usersFile.mapToPair(
@@ -531,38 +673,60 @@ public class SparkComputing
                 }
         );
 
-        // Join and get pairs film-id : (rate, user_id)
-        JavaPairRDD<Integer, Tuple2<Integer, Integer>> filmRateUser = filmRate.join(filmUser);
-
-        // Get airs user_id : (rate, title)
-        JavaPairRDD<Integer, Tuple2<Integer, String>> userRate = filmRateUser.join(filmTitle).values().mapToPair(
-                (Tuple2<Tuple2<Integer, Integer>,String> t) -> {
-                    return new Tuple2<>(t._1()._2(), new Tuple2<>(t._1()._1(), t._2()));
+        // Get pairs user_id : film_id , rate
+        JavaPairRDD<Integer, Tuple2<Integer, Integer>> filmUserRate = reviewsFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("\t");
+                    return new Tuple2<>(Integer.parseInt(line[0]), new Tuple2<>(Integer.parseInt(line[1]), Integer.parseInt(line[2])));
                 }
         );
 
-        // Get pairs age : (rate, title)
-        JavaPairRDD<Integer, Tuple2<Integer, String>> ageRate = userRate.join(userAge).values().mapToPair(
-                (Tuple2<Tuple2<Integer, String>,Integer> t) -> {
-                    return new Tuple2<>(t._2(), new Tuple2<>(t._1()._1(), t._1()._2()));
+        // Do pairs film : rate, age
+        JavaPairRDD<Integer, Tuple2<Integer, Integer>> ageRate = filmUserRate.join(userAge).mapToPair(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, Integer>, Integer>> t) -> new Tuple2<>(t._2()._1()._1(), new Tuple2<>(t._2()._1()._2(), t._2()._2()))
+        );
+
+        // Do pairs film, age : rate, title
+        JavaPairRDD<Tuple2<Integer, Integer>,Tuple2<Integer, String>> filmAgeRate = ageRate.join(filmTitle).mapToPair(
+                (Tuple2<Integer, Tuple2<Tuple2<Integer, Integer>, String>> t) -> {
+                    return new Tuple2<>(new Tuple2<>(t._1(), t._2()._1()._2()),new Tuple2<>(t._2()._1()._1(), t._2()._2()));
                 }
         );
 
-        List<Tuple2<Integer, Tuple2<Integer, String>>> res = ageRate.reduceByKey(
+        JavaPairRDD<Tuple2<Integer, Integer>,Tuple2<Integer, String>> sumRateAge = filmAgeRate.reduceByKey(
+                (Tuple2<Integer, String> t1, Tuple2<Integer, String> t2) -> new Tuple2<>(t1._1()+ t2._1(), t1._2())
+        );
+
+        // Do pairs age : rate, title
+        JavaPairRDD<Integer, Tuple2<Integer, String>> ageSumRate = sumRateAge.mapToPair(
+                (Tuple2<Tuple2<Integer, Integer>,Tuple2<Integer, String>> t) -> new Tuple2<>(t._1()._2(), new Tuple2<>(t._2()._1(), t._2()._2()))
+        );
+
+        JavaPairRDD<Integer, Tuple2<Integer, String>> resultAge = ageSumRate.reduceByKey(
                 (Tuple2<Integer, String> t1, Tuple2<Integer, String> t2) -> {
-                    if (t1._1() > t2._1()) return t1;
+                    if (t1._1()> t2._1()) return t1;
                     else return t2;
                 }
-        ).sortByKey(false).collect();
+        ).sortByKey(false);
 
-        MongoCollection<Document> collectionAge = db.getCollection("TopRatedFilmForAge");
-        Document docAge = new Document();
+        outputConfig.set("mongo.output.uri", "mongodb://localhost:27017/ResultDB.TopRatedAmongAgeGroup");
 
-        for (Tuple2<Integer, Tuple2<Integer, String>> t : res)
-        {
-            docAge.append(t._1().toString(), t._2()._2() + " " + t._2()._1());
-        }
-        collectionAge.insertOne(docAge);
+        JavaPairRDD<Object, BSONObject> saveAge = resultAge.mapToPair(
+                (Tuple2<Integer, Tuple2<Integer, String>> t) -> {
+                    BSONObject bson = new BasicBSONObject();
+                    bson.put("age", t._1());
+                    bson.put("rate", t._2()._1());
+                    bson.put("title", t._2()._2());
+                    return new Tuple2<>(null, bson);
+                }
+        );
+        saveAge.saveAsNewAPIHadoopFile(
+                "file:///tmp",
+                Object.class,
+                Object.class,
+                MongoOutputFormat.class,
+                outputConfig
+        );
 
         ///////////////////////////////////
         // by genre
@@ -592,46 +756,202 @@ public class SparkComputing
                 }
         );
 
-        // Get pairs genres : (rare, title)
-        JavaPairRDD<String, Tuple2<Integer, String>> genreRate = filmRate.join(filmGenre).values().mapToPair(
-                (Tuple2<Integer, Tuple2<String, String>> t) -> {
-                    return new Tuple2<>(t._2()._2(), new Tuple2<>(t._1(), t._2()._1()));
-                }
+        // Get pairs genres : (rate, title)
+        JavaPairRDD<String, Tuple2<Integer, String>> genreRate = sumRate.join(filmGenre).values().mapToPair(
+                (Tuple2<Integer, Tuple2<String, String>> t) -> new Tuple2<>(t._2()._2(), new Tuple2<>(t._1(), t._2()._1()))
         );
 
-        List<Tuple2<String, Tuple2<Integer, String>>> result = genreRate.reduceByKey(
+        JavaPairRDD<String, Tuple2<Integer, String>> sumGenre = genreRate.reduceByKey(
                 (Tuple2<Integer, String> t1, Tuple2<Integer, String> t2) -> {
                     if (t1._1()> t2._1()) return t1;
                     else return t2;
                 }
+        );
+
+        // Do pairs rate : genre, title and sort
+        JavaPairRDD<Integer, Tuple2<String, String>> resultGenre = sumGenre.mapToPair(
+                (Tuple2<String, Tuple2<Integer, String>> t) -> new Tuple2<>(t._2()._1(), new Tuple2<>(t._1(), t._2()._2())));
+
+        outputConfig.set("mongo.output.uri", "mongodb://localhost:27017/ResultDB.TopRatedAmongGenres");
+
+        JavaPairRDD<Object, BSONObject> saveGenre = resultGenre.mapToPair(
+                (Tuple2<Integer, Tuple2<String, String>> t) -> {
+                    BSONObject bson = new BasicBSONObject();
+                    bson.put("rate", t._1());
+                    bson.put("genre", t._2()._1());
+                    bson.put("title", t._2()._2());
+                    return new Tuple2<>(null, bson);
+                }
+        );
+        saveGenre.saveAsNewAPIHadoopFile(
+                "file:///tmp",
+                Object.class,
+                Object.class,
+                MongoOutputFormat.class,
+                outputConfig
+        );
+    }
+
+    ///////////////////////////////////////
+    // Get top-rated genres by each user
+    public void topGenresByUser()
+    {
+        List<String> genres = genresFile.map(
+                (String s) -> {
+                    String[] line = s.split("[|]");
+                    return line[0];
+                }
         ).collect();
 
-        MongoCollection<Document> collectionGenre = db.getCollection("TopRatedFilmForGenre");
-        Document docGenre = new Document();
+        // Get pairs film_id : genres
+        JavaPairRDD<Integer, String> filmGenre = filmsFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("[|]");
+                    StringBuilder genre = new StringBuilder();
+                    for (int i = 0; i < 19; i++) {
+                        if (Integer.parseInt(line[i + 5]) != 0)
+                            genre.append(genres.get(i)).append(" ");
+                    }
+                    return new Tuple2<>(Integer.parseInt(line[0]),genre.toString());
+                }
+        );
 
-        for (Tuple2<String, Tuple2<Integer, String>> t : result)
-        {
-            docGenre.append(t._1(), t._2._2() + " " + t._2()._1());
-        }
-        collectionGenre.insertOne(docGenre);
+        //Get pairs film_id : user, rate
+        JavaPairRDD<Integer, Tuple2<Integer, Integer>> filmUser = reviewsFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("\t");
+                    return new Tuple2<>(Integer.parseInt(line[1]), new Tuple2<>(Integer.parseInt(line[0]), Integer.parseInt(line[2])));
+                }
+        );
 
+        // Do pairs user_id, genre : rate
+        JavaPairRDD<Tuple2<Integer, String>, Integer> genreRate = filmGenre.join(filmUser).values().mapToPair(
+                (Tuple2<String, Tuple2<Integer, Integer>> t) -> {
+                    return new Tuple2<>(new Tuple2<>(t._2()._1(), t._1()), t._2()._2());
+                }
+        );
+
+        // Summarize the rating of each genre to the user
+        JavaPairRDD<Tuple2<Integer, String>, Integer> sumGenreRate = genreRate.reduceByKey(
+                (Integer a, Integer b) -> a + b
+        );
+
+        // Do pairs (user, rate) : genre
+        JavaPairRDD<Tuple2<Integer, Integer>, String> result = sumGenreRate.mapToPair(
+                (Tuple2<Tuple2<Integer, String>, Integer> t) ->{
+                    return new Tuple2<>(new Tuple2<>(t._1()._1(), t._2()), t._1()._2());
+                }
+        ).sortByKey(new yearComparator());
+
+        Configuration outputConfig = new Configuration();
+        outputConfig.set("mongo.output.uri", "mongodb://localhost:27017/ResultDB.TopRatedGenresByUsers");
+
+        JavaPairRDD<Object, BSONObject> save = result.mapToPair(
+                (Tuple2<Tuple2<Integer, Integer>, String> t) -> {
+                    BSONObject bson = new BasicBSONObject();
+                    bson.put("user", t._1()._1());
+                    bson.put("rate", t._1()._2());
+                    bson.put("genre", t._2());
+                    return new Tuple2<>(null, bson);
+                }
+        );
+        save.saveAsNewAPIHadoopFile(
+                "file:///tmp",
+                Object.class,
+                Object.class,
+                MongoOutputFormat.class,
+                outputConfig
+        );
     }
 
+    //////////////////////////////////////
+    // Get the latest three genres by each user
+    public void lastGenre()
+    {
+        List<String> genres = genresFile.map(
+                (String s) -> {
+                    String[] line = s.split("[|]");
+                    return line[0];
+                }
+        ).collect();
 
+        // Get pairs film_id : genres
+        JavaPairRDD<Integer, String> filmGenre = filmsFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("[|]");
+                    StringBuilder genre = new StringBuilder();
+                    for (int i = 0; i < 19; i++) {
+                        if (Integer.parseInt(line[i + 5]) != 0)
+                            genre.append(genres.get(i)).append(" ");
+                    }
+                    return new Tuple2<>(Integer.parseInt(line[0]),genre.toString());
+                }
+        );
 
-    // Comparator for (year, genres) : (rate, title)
-    private static class yearComparator implements Comparator<Tuple2<Integer, String>>, Serializable {
+        //Get pairs film_id : user, time
+        JavaPairRDD<Integer, Tuple2<Integer, Integer>> filmUser = reviewsFile.mapToPair(
+                (String s) -> {
+                    String[] line = s.split("\t");
+                    return new Tuple2<>(Integer.parseInt(line[1]), new Tuple2<>(Integer.parseInt(line[0]), Integer.parseInt(line[3])));
+                }
+        );
+
+        // Group by users
+        JavaPairRDD<Integer, Iterable<Tuple2<Integer, String>>> group = filmGenre.join(filmUser).values().mapToPair(
+                (Tuple2<String, Tuple2<Integer, Integer>> t) -> {
+                    return new Tuple2<>(t._2()._1(), new Tuple2<>(t._2()._2(), t._1()));
+                }
+        ).groupByKey().sortByKey(false);
+
+        // Get the latest three genres for each user
+        JavaPairRDD<Integer,Tuple2 <Integer, String>> result = group.flatMapToPair(
+                (Tuple2<Integer, Iterable<Tuple2<Integer, String>>> t) -> {
+                    List<Tuple2<Integer, String>> l = new ArrayList<>();
+                    Iterator<Tuple2<Integer, String>> iter = t._2().iterator();
+                    while (iter.hasNext())
+                        l.add(iter.next());
+
+                    Collections.sort(l, (o1, o2) -> o2._1().compareTo(o1._1()));
+
+                    List<Tuple2<Integer,Tuple2 <Integer, String>>> res = new ArrayList<>();
+                    for (int i = 0; i < 3; i++)
+                    {
+                        res.add(new Tuple2<>(t._1(), new Tuple2<>(l.get(i)._1(), l.get(i)._2())));
+                    }
+                    return res;
+                }
+        );
+
+        Configuration outputConfig = new Configuration();
+        outputConfig.set("mongo.output.uri", "mongodb://localhost:27017/ResultDB.LastGenres");
+
+        JavaPairRDD<Object, BSONObject> save = result.mapToPair(
+                (Tuple2<Integer,Tuple2 <Integer, String>> t) -> {
+                    BSONObject bson = new BasicBSONObject();
+                    bson.put("genres", t._2._2);
+                    bson.put("users", t._1());
+                    return new Tuple2<>(null, bson);
+                }
+        );
+        save.saveAsNewAPIHadoopFile(
+                "file:///tmp",
+                Object.class,
+                Object.class,
+                MongoOutputFormat.class,
+                outputConfig
+        );
+    }
+
+    // Comparator for (year, rate) : (genre, title)
+    private static class yearComparator implements Comparator<Tuple2<Integer, Integer>>, Serializable {
         @Override
-        public int compare(Tuple2<Integer, String> o1, Tuple2<Integer, String> o2) {
-            return o2._1().compareTo(o1._1());
+        public int compare(Tuple2<Integer, Integer> o1, Tuple2<Integer, Integer> o2) {
+            if (o2._1()>o1._1())
+                return 1;
+            else if (o2._1()<o1._1())
+                    return -1;
+                 else return o2._2().compareTo(o1._2());
         }
     }
 
-    // Comparator for gender : (rate, title)
-    private static class rateComparatop implements Comparator<Tuple2<String, Tuple2<Integer, String>>>, Serializable {
-        @Override
-        public int compare(Tuple2<String, Tuple2<Integer, String>> o1, Tuple2<String, Tuple2<Integer, String>> o2) {
-            return o2._2()._1().compareTo(o1._2()._1());
-        }
-    }
 }
